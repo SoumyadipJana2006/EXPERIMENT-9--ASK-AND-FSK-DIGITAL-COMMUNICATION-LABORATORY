@@ -1,0 +1,640 @@
+"""
+====================================================================================================
+EXPERIMENT 9: ASK AND FSK DIGITAL COMMUNICATION LABORATORY
+====================================================================================================
+Course: Digital Communication Systems Laboratory
+Topic : Binary Amplitude Shift Keying (BASK / OOK) and Binary Frequency Shift Keying (BFSK)
+        Modulation, Demodulation (Coherent & Non-coherent), Channel Noise (AWGN),
+        Correlator Architectures, Decision Statistics, Spectral Analysis, and BER Performance.
+
+Required Visualizations Generated:
+  1. Passband Waveforms (Baseband bits, ASK, BFSK, and Noisy Received Signals)
+  2. Power Spectra (PSD using Welch's method for ASK & BFSK passband signals)
+  3. Correlator Outputs (Integrate-and-dump real-time correlation trajectories & sample points)
+  4. Decision-Statistic Histograms (Conditional PDFs for bit '0' vs bit '1' with decision boundaries)
+  5. BER Curves (Monte Carlo Simulated BER vs. Exact Theoretical Curves for ASK & BFSK)
+====================================================================================================
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import time
+
+# Set random seed for deterministic & reproducible lab results
+np.random.seed(42)
+
+# =====================================================================
+# 1. SYSTEM CONFIGURATION & PARAMETERS
+# =====================================================================
+Rb = 1.0                # Bit rate (bits/second)
+Tb = 1.0 / Rb           # Bit duration (seconds)
+fs = 200                # Sampling frequency (Hz) -> 200 samples per bit for smooth waveforms
+Ns = int(Tb * fs)       # Samples per bit interval (samples/symbol)
+
+# Carrier frequencies (chosen to satisfy integer cycles per Tb & BFSK orthogonality)
+# Orthogonality condition: (f2 - f1) = k / (2*Tb) for coherent, k / Tb for arbitrary phase
+fc = 10.0               # ASK Carrier frequency (10 cycles per bit)
+f1 = 8.0                # BFSK Mark frequency (Tone 1, 8 cycles per bit)
+f2 = 14.0               # BFSK Space frequency (Tone 2, 14 cycles per bit)
+A = 1.0                 # Carrier Amplitude (Volts)
+
+# Simulation bit counts
+N_vis_bits = 10         # Number of bits for clear waveform / correlator visualizations
+N_stat_bits = 50000     # Number of bits for statistically rich histograms
+N_ber_bits = 100000     # Number of bits per SNR point for accurate Monte Carlo BER (down to 10^-5)
+
+# SNR list for BER evaluation (Eb/N0 in dB)
+EbN0_dB_list = np.arange(0, 13, 1)
+
+
+# =====================================================================
+# 2. ORTHOGONALITY VALIDATION
+# =====================================================================
+def verify_orthogonality(f1, f2, Tb, fs):
+    """
+    Validates mathematical orthogonality between BFSK tone 1 and tone 2 over bit period Tb.
+    """
+    t = np.arange(0, Tb, 1/fs)
+    phi1 = np.cos(2 * np.pi * f1 * t)
+    phi2 = np.cos(2 * np.pi * f2 * t)
+    
+    # Continuous-time inner product approximated by Riemann sum
+    inner_prod = np.sum(phi1 * phi2) / fs
+    norm_phi1 = np.sqrt(np.sum(phi1**2) / fs)
+    norm_phi2 = np.sqrt(np.sum(phi2**2) / fs)
+    cross_corr = inner_prod / (norm_phi1 * norm_phi2)
+    
+    print("\n" + "="*60)
+    print("           BFSK TONE ORTHOGONALITY VALIDATION")
+    print("="*60)
+    print(f"  Tone 1 (f1)            : {f1:.1f} Hz ({int(f1*Tb)} cycles/bit)")
+    print(f"  Tone 2 (f2)            : {f2:.1f} Hz ({int(f2*Tb)} cycles/bit)")
+    print(f"  Tone separation (Delta f): {abs(f2 - f1):.1f} Hz = {abs(f2 - f1)*Tb:.1f}/Tb")
+    print(f"  Inner Product <phi1, phi2>: {inner_prod:.6e}")
+    print(f"  Normalized Correlation   : {cross_corr:.6e}")
+    if abs(cross_corr) < 1e-3:
+        print("  Status: EXACTLY ORTHOGONAL over bit period Tb.")
+    else:
+        print("  Status: APPROXIMATELY ORTHOGONAL.")
+    print("="*60 + "\n")
+    return inner_prod
+
+
+# =====================================================================
+# 3. MODULATION MODULES (VECTORIZED)
+# =====================================================================
+def ask_modulate(bits, fc, Tb, fs, A=1.0):
+    """
+    Generates Binary Amplitude Shift Keying (BASK / OOK) passband waveform.
+    s(t) = A * cos(2*pi*fc*t) for bit 1, and 0 for bit 0.
+    """
+    dt = 1.0 / fs
+    t_bit = np.arange(0, Tb, dt)
+    carrier = A * np.cos(2 * np.pi * fc * t_bit)
+    
+    # Fast 2D broadcasting
+    # bits shape: (Nbits, 1), carrier shape: (1, Ns)
+    signal_matrix = bits[:, np.newaxis] * carrier[np.newaxis, :]
+    return signal_matrix.ravel()
+
+
+def bfsk_modulate(bits, f1, f2, Tb, fs, A=1.0):
+    """
+    Generates Binary Frequency Shift Keying (BFSK) passband waveform.
+    s(t) = A * cos(2*pi*f1*t) for bit 1 (Mark), A * cos(2*pi*f2*t) for bit 0 (Space).
+    """
+    dt = 1.0 / fs
+    t_bit = np.arange(0, Tb, dt)
+    tone1 = A * np.cos(2 * np.pi * f1 * t_bit)
+    tone2 = A * np.cos(2 * np.pi * f2 * t_bit)
+    
+    # Fast 2D broadcasting
+    b = bits[:, np.newaxis]
+    signal_matrix = b * tone1[np.newaxis, :] + (1 - b) * tone2[np.newaxis, :]
+    return signal_matrix.ravel()
+
+
+# =====================================================================
+# 4. AWGN CHANNEL (CALIBRATED TO ENERGY PER BIT Eb)
+# =====================================================================
+def add_awgn_channel(signal, EbN0_dB, mod_type='BFSK', A=1.0, Tb=1.0, fs=200):
+    """
+    Adds Additive White Gaussian Noise (AWGN) calibrated to Eb/N0 in dB.
+    
+    Energy per bit:
+      - For BFSK: Eb = A^2 * Tb / 2
+      - For ASK (OOK with equal priors): Eb = (1/2)*(A^2 * Tb / 2) = A^2 * Tb / 4
+      
+    Sample noise variance:
+      sigma_w^2 = (N0 / 2) * fs = (Eb / (10^(EbN0_dB/10))) * (fs / 2)
+    """
+    if mod_type == 'ASK':
+        Eb = (A**2 * Tb) / 4.0
+    else:  # BFSK
+        Eb = (A**2 * Tb) / 2.0
+        
+    EbN0_linear = 10.0 ** (EbN0_dB / 10.0)
+    N0 = Eb / EbN0_linear
+    sigma_w = np.sqrt((N0 / 2.0) * fs)
+    
+    noise = sigma_w * np.random.randn(len(signal))
+    return signal + noise, N0, sigma_w
+
+
+# =====================================================================
+# 5. DEMODULATION & CORRELATION DETECTORS (VECTORIZED)
+# =====================================================================
+def ask_coherent_demod(rx_signal, fc, Tb, fs, Nbits, A=1.0, return_continuous=False):
+    """
+    Coherent ASK Correlator Receiver:
+    Correlates with local carrier c(t) = cos(2*pi*fc*t).
+    Decision threshold gamma = (A * Tb) / 4.
+    """
+    Ns = int(Tb * fs)
+    dt = 1.0 / fs
+    t_bit = np.arange(0, Tb, dt)
+    carrier = np.cos(2 * np.pi * fc * t_bit)
+    gamma_threshold = (A * Tb) / 4.0
+    
+    # Reshape received signal to (Nbits, Ns)
+    rx_matrix = rx_signal[:Nbits * Ns].reshape(Nbits, Ns)
+    
+    # Discrete integration for each bit symbol
+    decision_stats = np.sum(rx_matrix * carrier, axis=1) * dt
+    detected_bits = (decision_stats > gamma_threshold).astype(int)
+    
+    continuous_corr = None
+    if return_continuous:
+        continuous_corr = (np.cumsum(rx_matrix * carrier, axis=1) * dt).ravel()
+        
+    return detected_bits, decision_stats, continuous_corr, gamma_threshold
+
+
+def bfsk_coherent_demod(rx_signal, f1, f2, Tb, fs, Nbits, return_continuous=False):
+    """
+    Coherent BFSK Dual-Correlator Receiver:
+    Correlates with c1(t) = cos(2*pi*f1*t) and c2(t) = cos(2*pi*f2*t).
+    Decision Statistic Lambda = r1 - r2. Threshold gamma = 0.
+    """
+    Ns = int(Tb * fs)
+    dt = 1.0 / fs
+    t_bit = np.arange(0, Tb, dt)
+    c1 = np.cos(2 * np.pi * f1 * t_bit)
+    c2 = np.cos(2 * np.pi * f2 * t_bit)
+    
+    rx_matrix = rx_signal[:Nbits * Ns].reshape(Nbits, Ns)
+    
+    r1_stats = np.sum(rx_matrix * c1, axis=1) * dt
+    r2_stats = np.sum(rx_matrix * c2, axis=1) * dt
+    decision_stats = r1_stats - r2_stats
+    detected_bits = (decision_stats > 0).astype(int)
+    
+    cont_r1, cont_r2, cont_diff = None, None, None
+    if return_continuous:
+        cont_r1 = (np.cumsum(rx_matrix * c1, axis=1) * dt).ravel()
+        cont_r2 = (np.cumsum(rx_matrix * c2, axis=1) * dt).ravel()
+        cont_diff = cont_r1 - cont_r2
+        
+    return detected_bits, decision_stats, r1_stats, r2_stats, cont_r1, cont_r2, cont_diff
+
+
+def bfsk_noncoherent_demod(rx_signal, f1, f2, Tb, fs, Nbits):
+    """
+    Non-coherent BFSK Quadrature / Envelope Correlator Detector:
+    Branch 1: I1 = int r*cos(w1*t), Q1 = int r*sin(w1*t) -> V1 = I1^2 + Q1^2
+    Branch 2: I2 = int r*cos(w2*t), Q2 = int r*sin(w2*t) -> V2 = I2^2 + Q2^2
+    Decision: 1 if V1 > V2 else 0.
+    """
+    Ns = int(Tb * fs)
+    dt = 1.0 / fs
+    t_bit = np.arange(0, Tb, dt)
+    
+    c1_cos = np.cos(2 * np.pi * f1 * t_bit)
+    c1_sin = np.sin(2 * np.pi * f1 * t_bit)
+    c2_cos = np.cos(2 * np.pi * f2 * t_bit)
+    c2_sin = np.sin(2 * np.pi * f2 * t_bit)
+    
+    rx_matrix = rx_signal[:Nbits * Ns].reshape(Nbits, Ns)
+    
+    I1 = np.sum(rx_matrix * c1_cos, axis=1) * dt
+    Q1 = np.sum(rx_matrix * c1_sin, axis=1) * dt
+    V1 = I1**2 + Q1**2
+    
+    I2 = np.sum(rx_matrix * c2_cos, axis=1) * dt
+    Q2 = np.sum(rx_matrix * c2_sin, axis=1) * dt
+    V2 = I2**2 + Q2**2
+    
+    decision_stats = V1 - V2
+    detected_bits = (V1 > V2).astype(int)
+    
+    return detected_bits, decision_stats
+
+
+def compute_psd_welch(signal, fs, nperseg=1024, noverlap=512):
+    """
+    Computes Power Spectral Density (PSD) using Welch's averaged periodogram with Hann window.
+    Pure NumPy implementation ensuring zero external dependencies.
+    """
+    step = nperseg - noverlap
+    window = np.hanning(nperseg)
+    scale = 1.0 / (fs * np.sum(window**2))
+    
+    num_segments = (len(signal) - noverlap) // step
+    psd_accum = np.zeros(nperseg // 2 + 1)
+    
+    for i in range(num_segments):
+        start = i * step
+        segment = signal[start:start + nperseg] * window
+        fft_vals = np.fft.rfft(segment, n=nperseg)
+        psd_accum += np.abs(fft_vals)**2
+        
+    psd = (psd_accum / num_segments) * scale
+    if nperseg % 2 == 0:
+        psd[1:-1] *= 2.0
+    else:
+        psd[1:] *= 2.0
+        
+    freqs = np.fft.rfftfreq(nperseg, 1.0 / fs)
+    return freqs, psd
+
+
+# =====================================================================
+# 6. THEORETICAL BER EQUATIONS
+# =====================================================================
+def q_func(x):
+    """
+    Gaussian Q-function in terms of complementary error function:
+    Q(x) = 0.5 * erfc(x / sqrt(2))
+    """
+    x_arr = np.asarray(x, dtype=float)
+    erfc_vec = np.vectorize(math.erfc)
+    return 0.5 * erfc_vec(x_arr / np.sqrt(2.0))
+
+def theoretical_ber_ask_coherent(EbN0_dB):
+    """Coherent BASK (OOK): Pb = Q(sqrt(Eb/N0))"""
+    EbN0_lin = 10.0 ** (np.array(EbN0_dB, dtype=float) / 10.0)
+    return q_func(np.sqrt(EbN0_lin))
+
+def theoretical_ber_bfsk_coherent(EbN0_dB):
+    """Coherent Orthogonal BFSK: Pb = Q(sqrt(Eb/N0))"""
+    EbN0_lin = 10.0 ** (np.array(EbN0_dB, dtype=float) / 10.0)
+    return q_func(np.sqrt(EbN0_lin))
+
+def theoretical_ber_bfsk_noncoherent(EbN0_dB):
+    """Non-coherent Orthogonal BFSK: Pb = 0.5 * exp(-0.5 * Eb/N0)"""
+    EbN0_lin = 10.0 ** (np.array(EbN0_dB, dtype=float) / 10.0)
+    return 0.5 * np.exp(-0.5 * EbN0_lin)
+
+
+# =====================================================================
+# 7. RUN DEMO EXPERIMENTS & GENERATE ALL 5 VISUALIZATIONS
+# =====================================================================
+def run_all_visualizations():
+    # -------------------------------------------------------------
+    # INITIAL SETUP & ORTHOGONALITY
+    # -------------------------------------------------------------
+    verify_orthogonality(f1, f2, Tb, fs)
+    
+    # Representative bit pattern for visualizations
+    demo_bits = np.array([1, 0, 1, 1, 0, 0, 1, 0, 1, 0])
+    N_demo = len(demo_bits)
+    t_demo = np.arange(0, N_demo * Tb, 1/fs)
+    
+    # Generate NRZ square pulse baseband representation
+    baseband_demo = np.repeat(demo_bits, Ns)
+    
+    # Modulated waveforms
+    ask_tx_demo = ask_modulate(demo_bits, fc, Tb, fs, A=A)
+    bfsk_tx_demo = bfsk_modulate(demo_bits, f1, f2, Tb, fs, A=A)
+    
+    # Add representative channel noise at Eb/N0 = 8 dB
+    demo_snr = 8.0
+    ask_rx_demo, _, _ = add_awgn_channel(ask_tx_demo, demo_snr, 'ASK', A, Tb, fs)
+    bfsk_rx_demo, _, _ = add_awgn_channel(bfsk_tx_demo, demo_snr, 'BFSK', A, Tb, fs)
+
+    # -------------------------------------------------------------
+    # VISUALIZATION 1: PASSBAND WAVEFORMS
+    # -------------------------------------------------------------
+    fig1, axs1 = plt.subplots(4, 1, figsize=(13, 10), sharex=True)
+    fig1.suptitle(f"Required Visualization 1: Time-Domain Passband Waveforms (SNR = {demo_snr:.0f} dB)", 
+                  fontsize=14, fontweight='bold', y=0.98)
+    
+    # Subplot 1: Baseband Digital Data
+    axs1[0].step(t_demo, baseband_demo, where='post', color='#1f77b4', lw=2.5, label='Digital Data Bits')
+    axs1[0].set_ylabel('Amplitude (V)', fontweight='bold')
+    axs1[0].set_ylim(-0.2, 1.4)
+    axs1[0].set_title("Input Binary Data Stream $b(t)$", fontweight='bold', fontsize=11)
+    axs1[0].grid(True, linestyle='--', alpha=0.6)
+    axs1[0].legend(loc='upper right')
+    
+    # Add bit value labels above waveform
+    for k, b in enumerate(demo_bits):
+        axs1[0].text((k + 0.5) * Tb, 1.15, f"b={b}", ha='center', va='center', 
+                     fontweight='bold', color='darkblue', fontsize=10,
+                     bbox=dict(boxstyle='round,pad=0.2', facecolor='azure', edgecolor='#1f77b4', alpha=0.8))
+        for ax in axs1:
+            ax.axvline(k * Tb, color='gray', linestyle=':', alpha=0.5)
+    axs1[0].axvline(N_demo * Tb, color='gray', linestyle=':', alpha=0.5)
+
+    # Subplot 2: ASK Passband Modulated Waveform
+    axs1[1].plot(t_demo, ask_tx_demo, color='#ff7f0e', lw=1.8, label=f'ASK Modulated ($f_c = {fc:.0f}$ Hz)')
+    axs1[1].set_ylabel('Amplitude (V)', fontweight='bold')
+    axs1[1].set_title(r"BASK / OOK Modulated Waveform: $s_{\mathrm{ASK}}(t) = A b_k \cos(2\pi f_c t)$", fontweight='bold', fontsize=11)
+    axs1[1].grid(True, linestyle='--', alpha=0.6)
+    axs1[1].legend(loc='upper right')
+
+    # Subplot 3: BFSK Passband Modulated Waveform
+    axs1[2].plot(t_demo, bfsk_tx_demo, color='#2ca02c', lw=1.8, label=f'BFSK ($f_1={f1:.0f}$ Hz / $f_2={f2:.0f}$ Hz)')
+    axs1[2].set_ylabel('Amplitude (V)', fontweight='bold')
+    axs1[2].set_title(r"BFSK Modulated Waveform: $s_{\mathrm{BFSK}}(t) = A \cos(2\pi [b_k f_1 + (1-b_k) f_2] t)$", fontweight='bold', fontsize=11)
+    axs1[2].grid(True, linestyle='--', alpha=0.6)
+    axs1[2].legend(loc='upper right')
+
+    # Subplot 4: Noisy Received Passband Signals
+    axs1[3].plot(t_demo, bfsk_rx_demo, color='#d62728', lw=1.0, alpha=0.85, label=f'Noisy BFSK Received $r(t) = s(t) + n(t)$')
+    axs1[3].set_xlabel('Time (seconds)', fontweight='bold', fontsize=11)
+    axs1[3].set_ylabel('Amplitude (V)', fontweight='bold')
+    axs1[3].set_title("Channel Output: Noisy Passband Signal", fontweight='bold', fontsize=11)
+    axs1[3].grid(True, linestyle='--', alpha=0.6)
+    axs1[3].legend(loc='upper right')
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("1_passband_waveforms.png", dpi=300)
+    print("[1/5] Generated & Saved '1_passband_waveforms.png'")
+
+    # -------------------------------------------------------------
+    # VISUALIZATION 2: POWER SPECTRA (PSD)
+    # -------------------------------------------------------------
+    # Generate long random sequence for high-fidelity spectral estimation
+    N_psd = 20000
+    psd_bits = np.random.randint(0, 2, N_psd)
+    ask_psd_sig = ask_modulate(psd_bits, fc, Tb, fs, A=A)
+    bfsk_psd_sig = bfsk_modulate(psd_bits, f1, f2, Tb, fs, A=A)
+    
+    nperseg = 1024
+    f_ask, p_ask = compute_psd_welch(ask_psd_sig, fs=fs, nperseg=nperseg, noverlap=nperseg//2)
+    f_bfsk, p_bfsk = compute_psd_welch(bfsk_psd_sig, fs=fs, nperseg=nperseg, noverlap=nperseg//2)
+    
+    fig2, axs2 = plt.subplots(2, 1, figsize=(12, 9))
+    fig2.suptitle("Required Visualization 2: Power Spectral Density (PSD) Analysis", 
+                  fontsize=14, fontweight='bold', y=0.98)
+    
+    # Subplot 1: Semi-logarithmic PSD (dB/Hz)
+    axs2[0].plot(f_ask, 10*np.log10(p_ask + 1e-12), color='#ff7f0e', lw=2.0, label=f'ASK PSD ($f_c = {fc:.0f}$ Hz)')
+    axs2[0].plot(f_bfsk, 10*np.log10(p_bfsk + 1e-12), color='#2ca02c', lw=2.0, label=f'BFSK PSD ($f_1 = {f1:.0f}$ Hz, $f_2 = {f2:.0f}$ Hz)')
+    axs2[0].axvline(fc, color='#ff7f0e', linestyle='--', alpha=0.7, label=f'ASK Carrier $f_c={fc:.0f}$ Hz')
+    axs2[0].axvline(f1, color='darkgreen', linestyle=':', alpha=0.7, label=f'BFSK Mark $f_1={f1:.0f}$ Hz')
+    axs2[0].axvline(f2, color='green', linestyle='-.', alpha=0.7, label=f'BFSK Space $f_2={f2:.0f}$ Hz')
+    axs2[0].set_title("Power Spectral Density (Logarithmic Scale dB/Hz)", fontweight='bold', fontsize=11)
+    axs2[0].set_xlabel("Frequency (Hz)", fontweight='bold')
+    axs2[0].set_ylabel("PSD (dB/Hz)", fontweight='bold')
+    axs2[0].set_xlim(0, 30)
+    axs2[0].set_ylim(-45, 5)
+    axs2[0].grid(True, which='both', linestyle='--', alpha=0.6)
+    axs2[0].legend(loc='upper right', framealpha=0.9)
+
+    # Subplot 2: Linear PSD with main-lobe bandwidth highlighting
+    axs2[1].plot(f_ask, p_ask, color='#ff7f0e', lw=2.0, label='ASK Spectrum (Linear)')
+    axs2[1].plot(f_bfsk, p_bfsk, color='#2ca02c', lw=2.0, label='BFSK Spectrum (Linear)')
+    axs2[1].fill_between(f_ask, p_ask, color='#ff7f0e', alpha=0.15)
+    axs2[1].fill_between(f_bfsk, p_bfsk, color='#2ca02c', alpha=0.15)
+    axs2[1].set_title("Power Spectral Density (Linear Power Scale)", fontweight='bold', fontsize=11)
+    axs2[1].set_xlabel("Frequency (Hz)", fontweight='bold')
+    axs2[1].set_ylabel("Power Density (V²/Hz)", fontweight='bold')
+    axs2[1].set_xlim(0, 30)
+    axs2[1].grid(True, linestyle='--', alpha=0.6)
+    axs2[1].legend(loc='upper right', framealpha=0.9)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("2_power_spectra.png", dpi=300)
+    print("[2/5] Generated & Saved '2_power_spectra.png'")
+
+    # -------------------------------------------------------------
+    # VISUALIZATION 3: CORRELATOR OUTPUTS (INTEGRATE-AND-DUMP)
+    # -------------------------------------------------------------
+    # Compute continuous correlator outputs for the demo sequence
+    _, ask_stats_demo, ask_cont_corr, ask_thresh = ask_coherent_demod(
+        ask_rx_demo, fc, Tb, fs, N_demo, A=A, return_continuous=True
+    )
+    _, bfsk_diff_stats, r1_stats, r2_stats, cont_r1, cont_r2, cont_diff = bfsk_coherent_demod(
+        bfsk_rx_demo, f1, f2, Tb, fs, N_demo, return_continuous=True
+    )
+    
+    sample_times = np.arange(1, N_demo + 1) * Tb - (1.0/fs)
+    
+    fig3, axs3 = plt.subplots(3, 1, figsize=(13, 9.5), sharex=True)
+    fig3.suptitle(f"Required Visualization 3: Real-Time Correlator Output Trajectories ($E_b/N_0 = {demo_snr:.0f}$ dB)", 
+                  fontsize=14, fontweight='bold', y=0.98)
+    
+    # Subplot 1: ASK Correlator Output
+    axs3[0].plot(t_demo, ask_cont_corr, color='#ff7f0e', lw=2.0, label='ASK Correlator $y_{\\mathrm{ASK}}(t) = \\int_0^t r(\\tau)\\cos(2\\pi f_c\\tau)d\\tau$')
+    axs3[0].scatter(sample_times, ask_stats_demo, color='red', s=50, zorder=5, label='Decision Samples at $t = k T_b$')
+    axs3[0].axhline(ask_thresh, color='black', linestyle='--', lw=1.8, label=f'Optimal Threshold $\\gamma = {ask_thresh:.2f}$ V')
+    axs3[0].set_ylabel('Correlator Output', fontweight='bold')
+    axs3[0].set_title("Coherent ASK Integrate-and-Dump Output", fontweight='bold', fontsize=11)
+    axs3[0].grid(True, linestyle='--', alpha=0.6)
+    axs3[0].legend(loc='upper right')
+    
+    # Subplot 2: BFSK Branch Correlators r1(t) and r2(t)
+    axs3[1].plot(t_demo, cont_r1, color='#1f77b4', lw=1.8, label='Branch 1 ($f_1$ correlator output $r_1(t)$)')
+    axs3[1].plot(t_demo, cont_r2, color='#d62728', lw=1.8, label='Branch 2 ($f_2$ correlator output $r_2(t)$)')
+    axs3[1].set_ylabel('Branch Output', fontweight='bold')
+    axs3[1].set_title("Coherent BFSK Dual-Branch Correlator Integration Trajectories", fontweight='bold', fontsize=11)
+    axs3[1].grid(True, linestyle='--', alpha=0.6)
+    axs3[1].legend(loc='upper right')
+
+    # Subplot 3: BFSK Difference Decision Statistic Lambda(t) = r1(t) - r2(t)
+    axs3[2].plot(t_demo, cont_diff, color='#2ca02c', lw=2.0, label='Difference Trajectory $\\Delta r(t) = r_1(t) - r_2(t)$')
+    axs3[2].scatter(sample_times, bfsk_diff_stats, color='darkred', s=50, zorder=5, label='Sampled Decision Variable $\\Lambda_k$')
+    axs3[2].axhline(0, color='black', linestyle='--', lw=1.8, label='Decision Boundary $\\gamma = 0$ V')
+    axs3[2].set_xlabel('Time (seconds)', fontweight='bold', fontsize=11)
+    axs3[2].set_ylabel('Difference $\\Lambda(t)$', fontweight='bold')
+    axs3[2].set_title(r"BFSK Decision Variable: Choose Bit 1 if $\Lambda_k > 0$, else Bit 0", fontweight='bold', fontsize=11)
+    axs3[2].grid(True, linestyle='--', alpha=0.6)
+    axs3[2].legend(loc='upper right')
+
+    for k, b in enumerate(demo_bits):
+        for ax in axs3:
+            ax.axvline(k * Tb, color='gray', linestyle=':', alpha=0.5)
+        axs3[0].text((k + 0.5) * Tb, 0.58, f"b={b}", ha='center', va='center',
+                     fontweight='bold', color='navy', fontsize=9,
+                     bbox=dict(boxstyle='square,pad=0.1', facecolor='aliceblue', alpha=0.7))
+    axs3[0].axvline(N_demo * Tb, color='gray', linestyle=':', alpha=0.5)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("3_correlator_outputs.png", dpi=300)
+    print("[3/5] Generated & Saved '3_correlator_outputs.png'")
+
+    # -------------------------------------------------------------
+    # VISUALIZATION 4: DECISION-STATISTIC HISTOGRAMS
+    # -------------------------------------------------------------
+    # Run high-sample count simulation for rich empirical conditional distributions
+    hist_bits = np.random.randint(0, 2, N_stat_bits)
+    hist_snr = 6.0  # Moderate SNR to clearly show Gaussian distributions and error overlap tails
+    
+    ask_hist_tx = ask_modulate(hist_bits, fc, Tb, fs, A=A)
+    bfsk_hist_tx = bfsk_modulate(hist_bits, f1, f2, Tb, fs, A=A)
+    
+    ask_hist_rx, N0_ask, sigma_w_ask = add_awgn_channel(ask_hist_tx, hist_snr, 'ASK', A, Tb, fs)
+    bfsk_hist_rx, N0_bfsk, sigma_w_bfsk = add_awgn_channel(bfsk_hist_tx, hist_snr, 'BFSK', A, Tb, fs)
+    
+    _, ask_hist_stats, _, ask_th = ask_coherent_demod(ask_hist_rx, fc, Tb, fs, N_stat_bits, A=A)
+    _, bfsk_hist_stats, _, _, _, _, _ = bfsk_coherent_demod(bfsk_hist_rx, f1, f2, Tb, fs, N_stat_bits)
+    _, bfsk_noncoh_stats = bfsk_noncoherent_demod(bfsk_hist_rx, f1, f2, Tb, fs, N_stat_bits)
+
+    # Separate decision statistics by transmitted bit
+    ask_stats_b0 = ask_hist_stats[hist_bits == 0]
+    ask_stats_b1 = ask_hist_stats[hist_bits == 1]
+    
+    bfsk_stats_b0 = bfsk_hist_stats[hist_bits == 0]
+    bfsk_stats_b1 = bfsk_hist_stats[hist_bits == 1]
+    
+    bfsk_non_b0 = bfsk_noncoh_stats[hist_bits == 0]
+    bfsk_non_b1 = bfsk_noncoh_stats[hist_bits == 1]
+
+    fig4, axs4 = plt.subplots(1, 3, figsize=(16, 5.5))
+    fig4.suptitle(f"Required Visualization 4: Decision-Statistic Empirical Distributions ($E_b/N_0 = {hist_snr:.0f}$ dB)", 
+                  fontsize=14, fontweight='bold', y=0.98)
+
+    # Subplot 1: ASK Coherent Histogram
+    axs4[0].hist(ask_stats_b0, bins=50, density=True, alpha=0.6, color='#1f77b4', label=r'Bit 0 sent: $p(\Lambda|b=0)$')
+    axs4[0].hist(ask_stats_b1, bins=50, density=True, alpha=0.6, color='#ff7f0e', label=r'Bit 1 sent: $p(\Lambda|b=1)$')
+    axs4[0].axvline(ask_th, color='red', linestyle='--', lw=2.0, label=f'Threshold $\\gamma = {ask_th:.2f}$')
+    axs4[0].set_title("Coherent BASK Decision Statistic $\\Lambda$", fontweight='bold', fontsize=11)
+    axs4[0].set_xlabel("Decision Variable Value", fontweight='bold')
+    axs4[0].set_ylabel("Probability Density $p(\\Lambda)$", fontweight='bold')
+    axs4[0].grid(True, linestyle='--', alpha=0.6)
+    axs4[0].legend(loc='upper right', fontsize=9)
+
+    # Subplot 2: BFSK Coherent Histogram
+    axs4[1].hist(bfsk_stats_b0, bins=50, density=True, alpha=0.6, color='#1f77b4', label=r'Bit 0 sent: $p(r_1 - r_2|b=0)$')
+    axs4[1].hist(bfsk_stats_b1, bins=50, density=True, alpha=0.6, color='#2ca02c', label=r'Bit 1 sent: $p(r_1 - r_2|b=1)$')
+    axs4[1].axvline(0, color='red', linestyle='--', lw=2.0, label='Threshold $\\gamma = 0$')
+    axs4[1].set_title("Coherent BFSK Decision Statistic $\\Lambda = r_1 - r_2$", fontweight='bold', fontsize=11)
+    axs4[1].set_xlabel("Decision Variable Value ($r_1 - r_2$)", fontweight='bold')
+    axs4[1].set_ylabel("Probability Density", fontweight='bold')
+    axs4[1].grid(True, linestyle='--', alpha=0.6)
+    axs4[1].legend(loc='upper right', fontsize=9)
+
+    # Subplot 3: BFSK Non-coherent Histogram (Envelope Detection Metric)
+    axs4[2].hist(bfsk_non_b0, bins=50, density=True, alpha=0.6, color='#1f77b4', label=r'Bit 0 sent: $p(V_1 - V_2|b=0)$')
+    axs4[2].hist(bfsk_non_b1, bins=50, density=True, alpha=0.6, color='#d62728', label=r'Bit 1 sent: $p(V_1 - V_2|b=1)$')
+    axs4[2].axvline(0, color='red', linestyle='--', lw=2.0, label='Threshold $\\gamma = 0$')
+    axs4[2].set_title("Non-coherent BFSK Decision Metric $V_1 - V_2$", fontweight='bold', fontsize=11)
+    axs4[2].set_xlabel("Envelope Metric ($V_1 - V_2$)", fontweight='bold')
+    axs4[2].set_ylabel("Probability Density", fontweight='bold')
+    axs4[2].grid(True, linestyle='--', alpha=0.6)
+    axs4[2].legend(loc='upper right', fontsize=9)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig("4_decision_statistic_histograms.png", dpi=300)
+    print("[4/5] Generated & Saved '4_decision_statistic_histograms.png'")
+
+    # -------------------------------------------------------------
+    # VISUALIZATION 5: BER CURVES (SIMULATED VS THEORETICAL)
+    # -------------------------------------------------------------
+    print("\nExecuting Monte Carlo Bit Error Rate Simulation across SNR range...")
+    start_time = time.time()
+    
+    ber_sim_ask_coh = []
+    ber_sim_bfsk_coh = []
+    ber_sim_bfsk_non = []
+    
+    # Pre-generate bits for the BER trial
+    ber_bits = np.random.randint(0, 2, N_ber_bits)
+    ask_ber_tx = ask_modulate(ber_bits, fc, Tb, fs, A=A)
+    bfsk_ber_tx = bfsk_modulate(ber_bits, f1, f2, Tb, fs, A=A)
+    
+    for snr_db in EbN0_dB_list:
+        # Channel simulation
+        rx_ask, _, _ = add_awgn_channel(ask_ber_tx, snr_db, 'ASK', A, Tb, fs)
+        rx_bfsk, _, _ = add_awgn_channel(bfsk_ber_tx, snr_db, 'BFSK', A, Tb, fs)
+        
+        # Demodulation
+        det_ask, _, _, _ = ask_coherent_demod(rx_ask, fc, Tb, fs, N_ber_bits, A=A)
+        det_bfsk_coh, _, _, _, _, _, _ = bfsk_coherent_demod(rx_bfsk, f1, f2, Tb, fs, N_ber_bits)
+        det_bfsk_non, _ = bfsk_noncoherent_demod(rx_bfsk, f1, f2, Tb, fs, N_ber_bits)
+        
+        # Compute BER
+        ber_ask = np.mean(ber_bits != det_ask)
+        ber_bfsk_c = np.mean(ber_bits != det_bfsk_coh)
+        ber_bfsk_n = np.mean(ber_bits != det_bfsk_non)
+        
+        ber_sim_ask_coh.append(ber_ask)
+        ber_sim_bfsk_coh.append(ber_bfsk_c)
+        ber_sim_bfsk_non.append(ber_bfsk_n)
+        
+    elapsed = time.time() - start_time
+    print(f"Monte Carlo BER Simulation finished in {elapsed:.2f} seconds.")
+
+    # High-resolution smooth theoretical curves
+    snr_fine_db = np.linspace(EbN0_dB_list[0], EbN0_dB_list[-1], 200)
+    ber_theo_ask = theoretical_ber_ask_coherent(snr_fine_db)
+    ber_theo_bfsk_coh = theoretical_ber_bfsk_coherent(snr_fine_db)
+    ber_theo_bfsk_non = theoretical_ber_bfsk_noncoherent(snr_fine_db)
+
+    fig5, ax5 = plt.subplots(figsize=(11, 7.5))
+    fig5.suptitle("Required Visualization 5: Bit Error Rate (BER) Performance vs. $E_b/N_0$", 
+                  fontsize=14, fontweight='bold', y=0.98)
+
+    # Theoretical lines
+    ax5.semilogy(snr_fine_db, ber_theo_ask, 'r-', lw=2.2, label=r'Theoretical ASK Coherent: $Q(\sqrt{E_b/N_0})$')
+    ax5.semilogy(snr_fine_db, ber_theo_bfsk_coh, 'b--', lw=2.2, label=r'Theoretical BFSK Coherent: $Q(\sqrt{E_b/N_0})$')
+    ax5.semilogy(snr_fine_db, ber_theo_bfsk_non, 'g-.', lw=2.2, label=r'Theoretical BFSK Non-coherent: $\frac{1}{2}\exp(-\frac{E_b}{2N_0})$')
+
+    # Simulated data points with distinct markers
+    # Filter 0 errors for clean semilog representation
+    mask_ask = np.array(ber_sim_ask_coh) > 0
+    mask_bfsk_c = np.array(ber_sim_bfsk_coh) > 0
+    mask_bfsk_n = np.array(ber_sim_bfsk_non) > 0
+
+    ax5.semilogy(EbN0_dB_list[mask_ask], np.array(ber_sim_ask_coh)[mask_ask], 'ro', markersize=7, 
+                 label='Simulated ASK Coherent (Monte Carlo)', fillstyle='none', markeredgewidth=2)
+    ax5.semilogy(EbN0_dB_list[mask_bfsk_c], np.array(ber_sim_bfsk_coh)[mask_bfsk_c], 'bs', markersize=7, 
+                 label='Simulated BFSK Coherent (Monte Carlo)', fillstyle='none', markeredgewidth=2)
+    ax5.semilogy(EbN0_dB_list[mask_bfsk_n], np.array(ber_sim_bfsk_non)[mask_bfsk_n], 'g^', markersize=7, 
+                 label='Simulated BFSK Non-coherent (Monte Carlo)', fillstyle='none', markeredgewidth=2)
+
+    ax5.set_xlabel("$E_b / N_0$ (dB)", fontweight='bold', fontsize=12)
+    ax5.set_ylabel("Bit Error Rate (BER)", fontweight='bold', fontsize=12)
+    ax5.set_title("Comparison of Modulations in AWGN Channel", fontweight='bold', fontsize=11)
+    ax5.set_xlim(0, 12)
+    ax5.set_ylim(1e-5, 1.0)
+    ax5.grid(True, which='both', linestyle='--', alpha=0.7)
+    ax5.legend(loc='lower left', fontsize=10, framealpha=0.95)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig("5_ber_curves.png", dpi=300)
+    print("[5/5] Generated & Saved '5_ber_curves.png'")
+
+    # -------------------------------------------------------------
+    # CONSOLE PERFORMANCE SUMMARY TABLE
+    # -------------------------------------------------------------
+    print("\n" + "="*82)
+    print("                    DIGITAL MODULATION BER COMPARISON TABLE")
+    print("="*82)
+    print(f"{'Eb/N0 (dB)':^11} | {'ASK Coherent (Sim / Theo)':^22} | {'BFSK Coherent (Sim / Theo)':^22} | {'BFSK Non-coh (Sim / Theo)':^22}")
+    print("-"*82)
+    for i, snr in enumerate(EbN0_dB_list):
+        sim_a = ber_sim_ask_coh[i]
+        theo_a = theoretical_ber_ask_coherent(snr)
+        
+        sim_bc = ber_sim_bfsk_coh[i]
+        theo_bc = theoretical_ber_bfsk_coherent(snr)
+        
+        sim_bn = ber_sim_bfsk_non[i]
+        theo_bn = theoretical_ber_bfsk_noncoherent(snr)
+        
+        print(f"{snr:^11.1f} | {sim_a:.5f} / {theo_a:.5f}      | {sim_bc:.5f} / {theo_bc:.5f}       | {sim_bn:.5f} / {theo_bn:.5f}")
+    print("="*82 + "\n")
+
+    # Display plots interactively
+    plt.show()
+
+
+# =====================================================================
+# SCRIPT ENTRY POINT
+# =====================================================================
+if __name__ == "__main__":
+    run_all_visualizations()
